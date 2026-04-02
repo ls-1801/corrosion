@@ -31,6 +31,15 @@ option(
     OFF
 )
 
+option(
+    CORROSION_NO_HOSTBUILD
+    "Disable hostbuild support. When ON, corrosion uses add_custom_command with a depfile \
+instead of add_custom_target for cargo builds, enabling proper incremental build support \
+(ninja reports 'no work to do' when nothing changed). This option is incompatible with \
+corrosion_set_hostbuild() and cross-compilation scenarios that require host-target builds."
+    OFF
+)
+
 if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin" AND CMAKE_SYSTEM_NAME STREQUAL "iOS")
     if(DEFINED CORROSION_HOST_TARGET_LINKER)
         set(_corrosion_host_linker "${CORROSION_HOST_TARGET_LINKER}")
@@ -266,6 +275,13 @@ function(_corrosion_copy_byproduct_deferred target_name output_dir_prop_names ca
         message(FATAL_ERROR "Unexpected additional arguments")
     endif()
 
+    # When CORROSION_NO_HOSTBUILD is ON, the copy is already included in the
+    # stamp file's add_custom_command (in _add_cargo_build). Skip the POST_BUILD copy.
+    get_target_property(_no_post_build _cargo-build_${target_name} _CORROSION_NO_POST_BUILD_COPY)
+    if(_no_post_build)
+        return()
+    endif()
+
     foreach(output_dir_prop_name ${output_dir_prop_names})
         get_target_property(output_dir ${target_name} "${output_dir_prop_name}")
         if(output_dir)
@@ -338,6 +354,7 @@ function(_corrosion_copy_byproduct_deferred target_name output_dir_prop_names ca
     list(TRANSFORM src_file_names PREPEND "${cargo_build_dir}/")
     list(TRANSFORM file_names PREPEND "${output_dir}/" OUTPUT_VARIABLE dst_file_names)
     message(DEBUG "Adding command to copy byproducts `${file_names}` to ${dst_file_names}")
+
     add_custom_command(TARGET _cargo-build_${target_name}
                         POST_BUILD
                         # output_dir may contain a Generator expression.
@@ -714,18 +731,28 @@ function(_add_cargo_build out_cargo_build_out_dir)
     set(no_default_features_arg "$<$<BOOL:${no_default_features_target_property}>:--no-default-features>")
 
     set(build_env_variable_genex "$<GENEX_EVAL:$<TARGET_PROPERTY:${target_name},${_CORR_PROP_ENV_VARS}>>")
-    set(hostbuild_override "$<BOOL:$<TARGET_PROPERTY:${target_name},${_CORR_PROP_HOST_BUILD}>>")
-    set(if_not_host_build_condition "$<NOT:${hostbuild_override}>")
 
-    set(corrosion_link_args "$<${if_not_host_build_condition}:${corrosion_link_args}>")
-    # We always set `--target`, so that cargo always places artifacts into a directory with the
-    # target triple.
-    set(cargo_target_option "--target=$<IF:${hostbuild_override},${_CORROSION_RUST_CARGO_HOST_TARGET},${_CORROSION_RUST_CARGO_TARGET}>")
-
-    # The target may be a filepath to custom target json file. For host targets we assume that they are built-in targets.
     _corrosion_strip_target_triple("${_CORROSION_RUST_CARGO_TARGET}" stripped_target_triple)
     _corrosion_strip_target_triple("${_CORROSION_RUST_CARGO_TARGET_UPPER}" stripped_target_triple_upper)
-    set(target_artifact_dir "$<IF:${hostbuild_override},${_CORROSION_RUST_CARGO_HOST_TARGET},${stripped_target_triple}>")
+
+    if(CORROSION_NO_HOSTBUILD)
+        # With CORROSION_NO_HOSTBUILD, resolve target paths at configure time (no genex).
+        # This allows using add_custom_command with OUTPUT/DEPFILE for proper incremental builds.
+        set(hostbuild_override "0")
+        set(if_not_host_build_condition "1")
+        set(cargo_target_option "--target=${_CORROSION_RUST_CARGO_TARGET}")
+        set(target_artifact_dir "${stripped_target_triple}")
+    else()
+        set(hostbuild_override "$<BOOL:$<TARGET_PROPERTY:${target_name},${_CORR_PROP_HOST_BUILD}>>")
+        set(if_not_host_build_condition "$<NOT:${hostbuild_override}>")
+        # We always set `--target`, so that cargo always places artifacts into a directory with the
+        # target triple.
+        set(cargo_target_option "--target=$<IF:${hostbuild_override},${_CORROSION_RUST_CARGO_HOST_TARGET},${_CORROSION_RUST_CARGO_TARGET}>")
+        # The target may be a filepath to custom target json file. For host targets we assume that they are built-in targets.
+        set(target_artifact_dir "$<IF:${hostbuild_override},${_CORROSION_RUST_CARGO_HOST_TARGET},${stripped_target_triple}>")
+    endif()
+
+    set(corrosion_link_args "$<${if_not_host_build_condition}:${corrosion_link_args}>")
 
     set(flags_genex "$<GENEX_EVAL:$<TARGET_PROPERTY:${target_name},INTERFACE_CORROSION_CARGO_FLAGS>>")
 
@@ -871,51 +898,100 @@ function(_add_cargo_build out_cargo_build_out_dir)
     message(DEBUG "TARGET ${target_name} produces byproducts ${build_byproducts}")
     message(DEBUG "corrosion_cc_rs_flags: ${corrosion_cc_rs_flags}")
 
-    add_custom_target(
-        _cargo-build_${target_name}
-        # Build crate
-        COMMAND
-            ${CMAKE_COMMAND} -E env
-                "${build_env_variable_genex}"
-                "${global_rustflags_genex}"
-                "${cargo_target_linker}"
-                "${cargo_host_target_linker}"
-                "${corrosion_cc_rs_flags}"
-                "${cargo_library_path}"
-                "CORROSION_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}"
-                "CARGO_BUILD_RUSTC=${rustc_bin}"
-            "${cargo_bin}"
-                rustc
-                ${cargo_rustc_filter}
-                ${cargo_target_option}
-                ${_CORROSION_VERBOSE_OUTPUT_FLAG}
-                ${all_features_arg}
-                ${no_default_features_arg}
-                ${features_genex}
-                --package ${package_name}
-                ${cargo_rustc_crate_types}
-                --manifest-path "${path_to_toml}"
-                --target-dir "${cargo_target_dir}"
-                ${cargo_profile}
-                ${flags_genex}
-                # Any arguments to cargo must be placed before this line
-                ${local_rustflags_delimiter}
-                ${local_rustflags_genex}
-
-        # Note: `BYPRODUCTS` may not contain **target specific** generator expressions.
-        # This means we cannot use `${cargo_build_dir}`, since it currently uses `$<TARGET_PROPERTY>`
-        # to determine the correct target directory, depending on if the hostbuild target property is
-        # set or not.
-        # BYPRODUCTS  "${cargo_build_dir}/${build_byproducts}"
-        
-        # Set WORKING_DIRECTORY to the directory containing the manifest, so that configuration files
-        # such as `.cargo/config.toml` or `toolchain.toml` are applied as expected. Cargo searches for
-        # configuration files by walking upward from the current directory.
-        WORKING_DIRECTORY "${workspace_toml_dir}"
-        ${cor_uses_terminal}
-        COMMAND_EXPAND_LISTS
-        VERBATIM
+    set(_cargo_build_command
+        ${CMAKE_COMMAND} -E env
+            "${build_env_variable_genex}"
+            "${global_rustflags_genex}"
+            "${cargo_target_linker}"
+            "${cargo_host_target_linker}"
+            "${corrosion_cc_rs_flags}"
+            "${cargo_library_path}"
+            "CORROSION_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+            "CARGO_BUILD_RUSTC=${rustc_bin}"
+        "${cargo_bin}"
+            rustc
+            ${cargo_rustc_filter}
+            ${cargo_target_option}
+            ${_CORROSION_VERBOSE_OUTPUT_FLAG}
+            ${all_features_arg}
+            ${no_default_features_arg}
+            ${features_genex}
+            --package ${package_name}
+            ${cargo_rustc_crate_types}
+            --manifest-path "${path_to_toml}"
+            --target-dir "${cargo_target_dir}"
+            ${cargo_profile}
+            ${flags_genex}
+            # Any arguments to cargo must be placed before this line
+            ${local_rustflags_delimiter}
+            ${local_rustflags_genex}
     )
+
+    if(CORROSION_NO_HOSTBUILD)
+        # With CORROSION_NO_HOSTBUILD, we can use add_custom_command with OUTPUT and DEPFILE
+        # because cargo_build_dir is a plain string (no target-property generator expressions).
+        # This enables proper incremental builds: ninja will report "no work to do" when
+        # no source files have changed.
+
+        # Derive the depfile name from the first byproduct (e.g., libfoo.a -> libfoo.d)
+        list(GET ACB_BYPRODUCTS 0 _first_byproduct)
+        get_filename_component(_byproduct_name_we "${_first_byproduct}" NAME_WE)
+        set(_cargo_depfile "${cargo_build_dir}/${_byproduct_name_we}.d")
+
+        set(_cargo_stamp_file "${CMAKE_CURRENT_BINARY_DIR}/_cargo-build_${target_name}.stamp")
+
+        # Prepare byproduct copy commands to include in the stamp custom command.
+        # By including them here (instead of POST_BUILD on a custom target), all
+        # outputs are tracked as file-based rules and ninja can properly detect
+        # "no work to do".
+        set(_copy_byproduct_src "")
+        set(_copy_byproduct_dst "")
+        foreach(_bp ${ACB_BYPRODUCTS})
+            list(APPEND _copy_byproduct_src "${cargo_build_dir}/${_bp}")
+            list(APPEND _copy_byproduct_dst "${CMAKE_CURRENT_BINARY_DIR}/${_bp}")
+        endforeach()
+
+        add_custom_command(
+            OUTPUT "${_cargo_stamp_file}"
+            COMMAND ${_cargo_build_command}
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_copy_byproduct_src} "${CMAKE_CURRENT_BINARY_DIR}"
+            COMMAND ${CMAKE_COMMAND} -E touch "${_cargo_stamp_file}"
+            BYPRODUCTS ${_copy_byproduct_dst}
+            DEPFILE "${_cargo_depfile}"
+            WORKING_DIRECTORY "${workspace_toml_dir}"
+            ${cor_uses_terminal}
+            COMMAND_EXPAND_LISTS
+            VERBATIM
+            COMMENT "Building Rust crate ${package_name} (incremental)"
+        )
+
+        # Store stamp file path and byproducts on the target so the deferred
+        # _corrosion_copy_byproduct_deferred can skip its POST_BUILD copy
+        # (we already handle it above).
+        add_custom_target(
+            _cargo-build_${target_name}
+            DEPENDS "${_cargo_stamp_file}"
+        )
+        set_target_properties(_cargo-build_${target_name} PROPERTIES
+            _CORROSION_STAMP_FILE "${_cargo_stamp_file}"
+            _CORROSION_NO_POST_BUILD_COPY TRUE
+        )
+    else()
+        add_custom_target(
+            _cargo-build_${target_name}
+            # Build crate
+            COMMAND ${_cargo_build_command}
+            # Note: `BYPRODUCTS` may not contain **target specific** generator expressions.
+            # This means we cannot use `${cargo_build_dir}`, since it currently uses `$<TARGET_PROPERTY>`
+            # to determine the correct target directory, depending on if the hostbuild target property is
+            # set or not.
+            # BYPRODUCTS  "${cargo_build_dir}/${build_byproducts}"
+            WORKING_DIRECTORY "${workspace_toml_dir}"
+            ${cor_uses_terminal}
+            COMMAND_EXPAND_LISTS
+            VERBATIM
+        )
+    endif()
 
     # User exposed custom target, that depends on the internal target.
     # Corrosion post build steps are added on the internal target, which
@@ -930,7 +1006,16 @@ function(_add_cargo_build out_cargo_build_out_dir)
     # Add custom target before actual build that user defined custom commands (e.g. code generators) can
     # use as a hook to do something before the build. This mainly exists to not expose the `_cargo-build` targets.
     add_custom_target(cargo-prebuild_${target_name})
-    add_dependencies(_cargo-build_${target_name} cargo-prebuild_${target_name})
+    if(CORROSION_NO_HOSTBUILD)
+        # When CORROSION_NO_HOSTBUILD is ON, we must not add cargo-prebuild as a dependency
+        # of _cargo-build_, because _cargo-build_ depends on a stamp file via
+        # add_custom_command, and any always-dirty custom target in that chain would
+        # defeat the depfile tracking. Instead, add it as a dependency of the public
+        # cargo-build_ target, which is already always-dirty (custom target with ALL).
+        add_dependencies(cargo-build_${target_name} cargo-prebuild_${target_name})
+    else()
+        add_dependencies(_cargo-build_${target_name} cargo-prebuild_${target_name})
+    endif()
     if(NOT TARGET cargo-prebuild)
         add_custom_target(cargo-prebuild)
     endif()
@@ -1164,6 +1249,13 @@ function(corrosion_set_linker target_name linker)
 endfunction()
 
 function(corrosion_set_hostbuild target_name)
+    if(CORROSION_NO_HOSTBUILD)
+        message(FATAL_ERROR
+            "corrosion_set_hostbuild() cannot be used when CORROSION_NO_HOSTBUILD is enabled. "
+            "CORROSION_NO_HOSTBUILD disables hostbuild support to enable proper incremental builds. "
+            "Set CORROSION_NO_HOSTBUILD to OFF if you need hostbuild support."
+        )
+    endif()
     # Configure the target to be compiled for the Host target and ignore any cross-compile configuration.
     set_property(
             TARGET ${target_name}
